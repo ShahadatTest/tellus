@@ -63,7 +63,7 @@ Tasks are defined in the [justfile](justfile):
   `persistence.rs`, `host_persistence.rs` and `persistence_tests.rs`, which also needs
   `persistence-tests`). Integration tests live in `tellus/tests/`: `ask.rs`, `persistence.rs`,
   `fairness.rs`, `how_to_unit_test.rs`, `how_to_unit_test_event_sourced.rs`,
-  `persistence_tests.rs`, `pipe_to_self.rs`, `queued.rs`, `supervision.rs`, `termination.rs`,
+  `persistence_tests.rs`, `pipe_to_self.rs`, `queued.rs`, `stash.rs`, `supervision.rs`, `termination.rs`,
   `test_context.rs`, `test_context_persistence.rs`, `timers.rs`, `watch.rs`, plus `cluster.rs`,
   which needs `--features cluster-dev`, has no test harness and runs its scenarios from `main`,
   spawning itself as further nodes. `test_context.rs` and `how_to_unit_test.rs` need `--features
@@ -348,7 +348,7 @@ Item order within a file:
   recovery state re-arms it, an older one is ignored) rather than inventing transitions. Depends
   on tellus, the inspect crate and the demo's library for the wire types; a default workspace
   member gated by `just all`, run with `just run-cluster-demo-tui`.
-- `tellus/src/testing.rs` (feature `test-util`): `TestContext`, a real `ActorContext` plus the mailbox behind it, for calling `Actor` and `EventSourced` methods directly in unit tests; its `terminate` is the production `actor_context::terminate` run with `()` as the actor value, so the descendant barrier is not duplicated. `TestContext::new` is the context of an `Untimed` actor and `TestContext::timed` that of a `Timed` one; only the latter has `timers`, listing the pending ones as `PendingTimer` values, and `fire_timer`, which fires one as the run loop would, whatever its delay, since no timer fires by itself. With `persistence` it also holds `settle`, the store-free part of `spawn.rs`'s settlement (`apply_events`, then the `then` continuations), and `Effect::events` / `Effect::stop_requested` are gated on `test-util`. `docs/actors.md` and `docs/persistence.md` show the two doctests of this module as their Testing examples; keep them identical.
+- `tellus/src/testing.rs` (feature `test-util`): `TestContext`, a real `ActorContext` plus the mailbox behind it, for calling `Actor` and `EventSourced` methods directly in unit tests; its `terminate` is the production `actor_context::terminate` run with `()` as the actor value, so the descendant barrier is not duplicated. `TestContext::new` is the context of an `Untimed` actor and `TestContext::timed` that of a `Timed` one; only the latter has `timers`, listing the pending ones as `PendingTimer` values, and `fire_timer`, which fires one as the run loop would, whatever its delay, since no timer fires by itself. `with_mailbox_capacity` and `timed_with_mailbox_capacity` bound the mailbox and with it the stash, and `take_stashed` and `take_unstashed` settle the stash requests first, never holding one. With `persistence` it also holds `settle`, the store-free part of `spawn.rs`'s settlement (`apply_events`, then the `then` continuations), and `Effect::events` / `Effect::stop_requested` are gated on `test-util`. `docs/actors.md` and `docs/persistence.md` show the two doctests of this module as their Testing examples; keep them identical.
 - `tellus-comparison/`: competitive benchmarks with strict fairness rules (unbounded mailboxes
   everywhere, fire-and-forget sends only, identical timing boundaries); read its README before
   changing any benchmark.
@@ -393,6 +393,16 @@ cross-file invariants:
   itself lives in `watch.rs` (`Watcher`, `WatcherRegistry` and the `TerminatedHandler` a watcher
   runs); the mailbox half holds the registry and implements that trait for its own sender, and
   registration closes atomically with termination, so watch is race-free.
+- `stash.rs` holds what an actor deferred with `ActorContext::stash`, what `unstash_all` handed
+  back, and the requests of the item in hand. The run loop settles those with `settle_stash` once
+  `receive`, `init` or `recovered` has returned, or once an event-sourced append has succeeded. A
+  failure leaves them to `should_restart`, which discards them and hands the whole stash back. Both
+  `next_incoming` macros take an unstashed item right behind the parent's stop, ahead of a due timer
+  and the mailbox, and skip the unwatch check for it, since `unwatch` drops the stashed signals of
+  the unwatched actor itself. An `unstash_all` made during a drain is held until the drain is over.
+  It then takes effect at once if the drain shrank the stash, else after one mailbox item, so a
+  drain cannot starve the mailbox. The stash has the mailbox's capacity, which terminated signals
+  skip, and is dropped at termination with the queued items.
 - `unwatch` is enforced on the watcher's side: the run loop drops a terminated signal whose sender
   is no longer watched before `receive` ever sees it.
 - Supervision (`actor_config.rs`): errors and panics (both `init` and `receive` run under

@@ -14,8 +14,8 @@ use std::{
     time::Duration,
 };
 use tellus::{
-    Actor, ActorConfig, ActorContext, ActorRef, ActorSystem, AppendError, Backoff, Cbor, Codec,
-    Control, Effect, EncodeError, EncodedEvent, EncodedSnapshot, EventSourced, EventStore,
+    Actor, ActorConfig, ActorContext, ActorRef, ActorSystem, AppendError, AskError, Backoff, Cbor,
+    Codec, Control, Effect, EncodeError, EncodedEvent, EncodedSnapshot, EventSourced, EventStore,
     InMemoryStore, Incoming, Nothing, PayloadError, Persistence, PersistenceId, ReplyTo,
     RestartPolicy, SchemaVersion, SeqNo, SnapshotStore, StoredEvent, StoredSnapshot,
     SupervisionStrategy, Timed, Untimed, Versioned,
@@ -23,6 +23,7 @@ use tellus::{
 use thiserror::Error;
 use tokio::{
     sync::mpsc,
+    task::spawn,
     time::{advance, sleep, timeout},
 };
 
@@ -455,6 +456,55 @@ async fn an_append_store_failure_restarts_and_consumes_the_command() {
         .await
         .expect("no reply to second get");
     assert_eq!(count, 2);
+
+    system.root().tell(Command::Stop);
+    assert_terminates(system, "system did not terminate").await;
+}
+
+/// A failed append discards the stash requests of its command along with its events: the `Get`
+/// stashed by the failed command is dropped, so its `ask` resolves as `NoReply`, while the one
+/// stashed by a durable command is handed back by `unstash_all`.
+#[tokio::test]
+async fn a_failed_append_discards_the_stash_requests_of_its_command() {
+    let store = FaultyStore::default().with_append_failures(1);
+    let (probe_tx, mut probe_rx) = mpsc::unbounded_channel();
+
+    let system = ActorSystem::event_sourced_with_config(
+        Counter::new("deferring", probe_tx),
+        Persistence::new(store),
+        restart_config(),
+    );
+    assert_eq!(recv(&mut probe_rx, "no init probe").await, Probe::Init);
+    assert_eq!(
+        recv(&mut probe_rx, "no recovered probe").await,
+        Probe::Recovered
+    );
+
+    let deferred = system
+        .root()
+        .ask(TIMEOUT, |reply_to| Command::IncrementAndDefer(1, reply_to))
+        .await;
+    assert!(matches!(deferred, Err(AskError::NoReply)));
+    for expected in [Probe::Handled, Probe::Init, Probe::Recovered] {
+        assert_eq!(
+            recv(&mut probe_rx, "no probe around the failed append").await,
+            expected
+        );
+    }
+
+    let root = system.root().clone();
+    let deferred = spawn(async move {
+        root.ask(TIMEOUT, |reply_to| Command::IncrementAndDefer(2, reply_to))
+            .await
+    });
+    assert_eq!(
+        recv(&mut probe_rx, "no handled probe").await,
+        Probe::Handled
+    );
+    system.root().tell(Command::Undefer);
+
+    let deferred = deferred.await.expect("the ask task panicked");
+    assert_eq!(deferred.expect("the deferred get was not answered"), 2);
 
     system.root().tell(Command::Stop);
     assert_terminates(system, "system did not terminate").await;
@@ -1160,7 +1210,7 @@ impl EventSourced for Counter {
 
     fn handle(
         &self,
-        _: &ActorContext<Self::Command>,
+        context: &ActorContext<Self::Command>,
         incoming: Incoming<Self::Command>,
         _: &Self::State,
     ) -> Result<Effect<Self>, Self::Error> {
@@ -1168,7 +1218,22 @@ impl EventSourced for Counter {
             return Ok(Effect::none());
         };
         let _ = self.probe_tx.send(Probe::Handled);
-        counter_effect(&self.probe_tx, command)
+
+        match command {
+            Command::IncrementAndDefer(n, reply_to) => {
+                context
+                    .stash(Incoming::Message(Command::Get(reply_to)))
+                    .expect("the stash is unbounded");
+                Ok(Effect::persist(Increased(n)))
+            }
+
+            Command::Undefer => {
+                context.unstash_all();
+                Ok(Effect::none())
+            }
+
+            command => counter_effect(&self.probe_tx, command),
+        }
     }
 
     fn apply(&self, state: Self::State, Increased(n): Self::Event) -> Self::State {
@@ -1269,6 +1334,8 @@ enum Command {
     Increment(u64),
     IncrementTwice(u64, u64),
     Get(ReplyTo<u64>),
+    IncrementAndDefer(u64, ReplyTo<u64>),
+    Undefer,
     Fail,
     Stop,
     StopAfter(u64),
@@ -1776,5 +1843,9 @@ where
         Command::StopAfter(n) => Ok(Effect::persist(Increased(n)).and_stop()),
 
         Command::StartTimer => unreachable!("only a TimedCounter is told StartTimer"),
+
+        Command::IncrementAndDefer(..) | Command::Undefer => {
+            unreachable!("only a Counter is told to defer")
+        }
     }
 }

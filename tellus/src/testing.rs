@@ -9,7 +9,7 @@
 
 use crate::{
     ActorContext, ActorId, Incoming, MailboxCapacity, Timed, TimerMode, Untimed, actor_context,
-    actor_ref::SelfRef, mailbox::Mailbox,
+    actor_ref::SelfRef, mailbox::Mailbox, stash::Source,
 };
 #[cfg(feature = "persistence")]
 use crate::{
@@ -29,9 +29,11 @@ use tokio::time::Instant;
 ///
 /// Calling an actor directly bypasses the run loop. Notably, a terminated signal passed to
 /// [Actor::receive] is not dropped when its sender is no longer watched, and nothing restarts the
-/// actor on failure. [ActorContext::spawn] still spawns a real child actor, hence needs a Tokio
-/// runtime; the child is asked to stop when the [TestContext] is dropped, and
-/// [TestContext::terminate] waits for it.
+/// actor on failure. [TestContext::take_stashed] and [TestContext::take_unstashed] apply the stash
+/// requests made so far even after a failed call, whose requests the run loop discards. They never
+/// hold an [ActorContext::unstash_all] either, since a [TestContext] has no drains.
+/// [ActorContext::spawn] still spawns a real child actor, hence needs a Tokio runtime; the child is
+/// asked to stop when the [TestContext] is dropped, and [TestContext::terminate] waits for it.
 ///
 /// `T` is the actor's [TimerMode]; [TestContext::new] creates an [Untimed] context and
 /// [TestContext::timed] a [Timed] one. No timer fires when its delay elapses; see
@@ -103,6 +105,19 @@ where
         &self.context
     }
 
+    /// Everything the actor has stashed and not unstashed yet, in the order it was stashed. The
+    /// stash requests made so far take effect first, as once an item is settled.
+    pub fn take_stashed(&mut self) -> Vec<Incoming<M>> {
+        self.context.take_stashed()
+    }
+
+    /// Everything the actor has unstashed, in the order the run loop would receive it, ahead of
+    /// the mailbox. The stash requests made so far take effect first, as once an item is settled.
+    pub fn take_unstashed(&mut self) -> Vec<Incoming<M>> {
+        self.context.settle_stash(Source::Start);
+        iter::from_fn(|| self.context.take_unstashed()).collect()
+    }
+
     /// Terminate this context's actor as the run loop would: stop its children and wait until all
     /// of them have terminated, and only then send [Incoming::Terminated] to its watchers.
     ///
@@ -112,11 +127,11 @@ where
         actor_context::terminate((), self.context, self.mailbox).await;
     }
 
-    fn with_fresh_id() -> Self
+    fn with_fresh_id(mailbox_capacity: MailboxCapacity) -> Self
     where
         M: Send + 'static,
     {
-        let (self_ref, mailbox) = SelfRef::new(ActorId::new(), MailboxCapacity::Unbounded);
+        let (self_ref, mailbox) = SelfRef::new(ActorId::new(), mailbox_capacity);
 
         Self {
             context: ActorContext::new(self_ref),
@@ -132,7 +147,16 @@ impl<M> TestContext<M, Untimed> {
     where
         M: Send + 'static,
     {
-        Self::with_fresh_id()
+        Self::with_fresh_id(MailboxCapacity::Unbounded)
+    }
+
+    /// Create an [Untimed] context like [TestContext::new], with a mailbox of the given capacity,
+    /// which the stash shares as in the run loop.
+    pub fn with_mailbox_capacity(mailbox_capacity: MailboxCapacity) -> Self
+    where
+        M: Send + 'static,
+    {
+        Self::with_fresh_id(mailbox_capacity)
     }
 
     /// Create a [Timed] context with a fresh [ActorId] and an unbounded mailbox. Needs no Tokio
@@ -141,7 +165,16 @@ impl<M> TestContext<M, Untimed> {
     where
         M: Send + 'static,
     {
-        TestContext::with_fresh_id()
+        TestContext::with_fresh_id(MailboxCapacity::Unbounded)
+    }
+
+    /// Create a [Timed] context like [TestContext::timed], with a mailbox of the given capacity,
+    /// which the stash shares as in the run loop.
+    pub fn timed_with_mailbox_capacity(mailbox_capacity: MailboxCapacity) -> TestContext<M, Timed>
+    where
+        M: Send + 'static,
+    {
+        TestContext::with_fresh_id(mailbox_capacity)
     }
 
     /// Everything enqueued in the mailbox since the last call, in the order it arrived. Does not

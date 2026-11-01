@@ -130,7 +130,8 @@ The capacity does not cap what the actor started itself. The outputs of its pipe
 replies to its `reply_to` destinations pass a full mailbox, up to one per future in flight and one
 per open `ReplyTo`. Nothing limits how many of those are open. An actor which pipes a future or
 opens a `reply_to` per request to a slow backend can hence hold far more than its capacity, unless
-it bounds its open requests itself, e.g. with a window.
+it bounds its open requests itself, e.g. with a window. An actor which stashes (see stashing below)
+holds up to its capacity again in the stash.
 
 The `serde` feature makes the whole configuration deserializable, so it can come from a config
 file. The invariants it carries, `0 < min` and `min <= max` on the backoff bounds, live in
@@ -301,6 +302,64 @@ with the time remaining, and `TestContext::fire_timer` fires one as the run loop
 delay. `take_incoming` then returns its message behind the items which were queued when it fired,
 unless the actor cancels or replaces the timer first.
 
+## Stashing
+
+An actor which waits for something, e.g. the output of a piped future, sometimes must not handle
+other messages before it arrives. [`ActorContext::stash`](../tellus/src/actor_context.rs) defers
+such a message. It takes the `Incoming` as `receive` got it, so a terminated signal keeps its place
+behind the messages of the stopped actor, and the death watch ordering guarantee survives stashing.
+`ActorContext::unstash_all` hands everything stashed back to the run loop, which receives it one
+`receive` per item and in the order it was stashed, so per-sender FIFO holds. The actor decides what
+it defers and when it handles it, which keeps the explicitness of synchronous handlers; an `await`
+would defer everything. Akka Typed's `StashBuffer` is the model, with three differences: a full
+stash hands the item back instead of throwing, signals can be stashed, and unstashed items go
+through the run loop one `receive` at a time instead of being handled inside the call.
+
+`stash` and `unstash_all` are requests. They take effect once the item at hand is settled: for a
+plain actor when `receive` or `init` has returned successfully, for an event-sourced one when
+`recovered` has returned or once the command's events are durable (see
+[persistence.md](persistence.md)). A failure discards them, so an
+actor which stashes the item it is handling and then fails does not get that item back after the
+restart. The requests made while handling one item take effect in the order they were made:
+`stash(x)` followed by `unstash_all` hands `x` back, while `unstash_all` followed by `stash(x)`
+keeps it stashed.
+
+The run loop receives unstashed items ahead of a due timer and of the mailbox; only a stop by the
+parent comes first. Timers keep their positions, which count mailbox receptions only (see timers
+above), so unstashed items never move a timer ahead of the messages queued before it fired. The
+items one `unstash_all` hands back form a drain. An `unstash_all` made while receiving one of them
+is held until the drain is over. It then takes effect right away if the stash is smaller than when
+the drain began, and otherwise once one item from the mailbox has been received. A due timer does
+not count as that item. An actor which stashes every item again, as a retry loop does, hence waits
+for its next message instead of draining forever. Each immediate release needs a smaller stash than
+the drain before it began with, so the mailbox waits behind at most as many drains as there are
+stashed items. A drain thus cannot starve the mailbox.
+
+The stash has the capacity of the mailbox: unbounded with an unbounded mailbox, `n` with a mailbox
+bounded to `n`, counting the unstashed items not received yet and the requests made so far. A
+terminated signal skips that capacity and does not count, as it does in the mailbox. A stashed
+message counts whatever its origin, so the outputs of piped futures and the replies to `reply_to`
+destinations, which pass a full mailbox, do not pass a full stash. A full stash hands the incoming
+back as the error of `stash`, and the actor decides what to do with it. A stashed item has left the
+mailbox and frees its capacity, so a bounded actor holds at most twice its capacity in mailbox and
+stash together. `queued` counts the mailbox only.
+
+The stash lives on the context ([`stash.rs`](../tellus/src/stash.rs)). A restart hands every stashed
+item back, as Akka classic's `preRestart` does, so the new state receives them first, in order. That
+is after `init`, or after recovery and `recovered` for an event-sourced actor, and the new state
+decides for itself. Termination drops the stashed items like the queued ones, under
+`drop_containing_panic`, so a `ReplyTo` stashed inside a request resolves its `ask` as `NoReply`.
+`unwatch` drops the stashed terminated signals of the unwatched actor, unstashed ones not received
+yet included, so its promise holds for the stash too. A signal stashed after the call stays. An
+unstashed item skips the unwatch check of the run loop, which consumed the watch when the signal
+first arrived. Event-sourced actors stash the same way through `handle`, since both run loops take
+their next item through the same code. An actor which never stashes pays one length check per item
+in the run loop and one check for requests once the item is settled.
+
+In a unit test, [`TestContext::take_stashed`](../tellus/src/testing.rs) returns what the actor has
+stashed and `TestContext::take_unstashed` what `unstash_all` handed to the run loop, in the order it
+would be received. Both apply the requests made so far first (see testing below).
+
 ## Mailboxes
 
 A mailbox ([`mailbox.rs`](../tellus/src/mailbox.rs)) is a FIFO channel of `Incoming<M>` split
@@ -317,14 +376,15 @@ a terminated signal must never be dropped.
 
 An actor reads its own mailbox depth through `ActorContext::queued`: the number of items not
 received yet, terminated signals included. Due timers are not items, so they are not counted (see
-timers above). An actor which writes to a database or a socket can flush once its mailbox has run
-empty, and one which is overloaded can shed load, both as part of its own protocol. For the actor
-itself the value is a lower bound, since only the actor removes items. The run loop drops the
-terminated signals of unwatched actors before `receive` sees them, so the count can exceed what
-`receive` will get by that many. `queued` takes the channel's length under its lock, which every
-send and receive takes as well, so nothing is paid until it is called. The depth is deliberately not
-on `ActorRef`: for a remote reference it would need a round trip, so other actors ask through the
-actor's protocol. Nor is it flow control, since senders do not see it; for that, bound the mailbox.
+timers above), and neither are stashed items (see stashing above). An actor which writes to a
+database or a socket can flush once its mailbox has run empty, and one which is overloaded can shed
+load, both as part of its own protocol. For the actor itself the value is a lower bound, since only
+the actor removes items. The run loop drops the terminated signals of unwatched actors before
+`receive` sees them, so the count can exceed what `receive` will get by that many. `queued` takes
+the channel's length under its lock, which every send and receive takes as well, so nothing is paid
+until it is called. The depth is deliberately not on `ActorRef`: for a remote reference it would
+need a round trip, so other actors ask through the actor's protocol. Nor is it flow control, since
+senders do not see it; for that, bound the mailbox.
 
 The mailbox also owns watcher registration ([`watch.rs`](../tellus/src/watch.rs)): watchers are
 collected in a map keyed by watcher ID which termination takes and closes atomically, so a watcher
@@ -627,6 +687,9 @@ Calling an actor directly differs from running it in a few ways:
   `take_incoming`.
 - Nothing supervises the call: an error or a panic reaches the test, and nothing restarts the
   actor.
+- `take_stashed` and `take_unstashed` apply the stash requests made so far, even after a failed
+  call, whose requests the run loop discards. They never hold an `unstash_all`, since a direct call
+  is no drain.
 - `spawn` starts a real child actor, hence needs a Tokio runtime, for example `#[tokio::test]`.
   Dropping the `TestContext` asks the children to stop without waiting for them.
 - To test `watch`, simulate the watched actor with a second `TestContext`: watch its `self_ref()`,
@@ -664,6 +727,9 @@ has to wait for the actor, since `tell` returns before the message is handled.
 - A message which arrived before a timer's deadline is handled before the timer's message. The run
   loop fires a due timer between two items, so it can also land behind messages which arrived
   while the actor was busy, e.g. in a long `receive` or an event-sourced settlement.
+- Stashed items are received after `unstash_all`, ahead of a due timer and of the mailbox but behind
+  a stop by the parent, in the order they were stashed. A drain cannot starve the mailbox. A restart
+  hands the stash back to the new state, and termination drops it like the mailbox.
 - A host has at most one incarnation of an entity at any time: a replacement is spawned only once
   the previous one's terminated signal has arrived.
 - A message for an entity which is stopping is enqueued to its next incarnation, in order, up to

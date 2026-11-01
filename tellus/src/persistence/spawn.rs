@@ -20,6 +20,7 @@ use crate::{
         },
         versioned::{DecodeError, Versioned, decode_versioned},
     },
+    stash::Source,
     timers::{Sealed, Timed, Token, Untimed},
 };
 use std::{
@@ -234,12 +235,13 @@ macro_rules! run_event_sourced {
                     });
 
                     if let Some(mut state) = state {
+                        context.settle_stash(Source::Start);
                         up_since = Some(Instant::now());
 
                         loop {
-                            let incoming =
+                            let next =
                                 $next_incoming!($actor_id, $mailbox, context, stopped_by_parent);
-                            let Some(incoming) = incoming else {
+                            let Some((incoming, source)) = next else {
                                 drop_containing_panic($actor_id, STATE_FAILED_TO_DROP, state);
                                 break 'run;
                             };
@@ -264,6 +266,7 @@ macro_rules! run_event_sourced {
                             .await
                             {
                                 Some(settled) => {
+                                    context.settle_stash(source);
                                     state = settled.state;
                                     next_seq_no = settled.next_seq_no;
 

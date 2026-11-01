@@ -181,6 +181,7 @@ impl<M> Clone for Sink<M> {
 #[derive(Debug)]
 pub(crate) struct SelfRef<M> {
     actor_ref: ActorRef<M>,
+    mailbox_capacity: MailboxCapacity,
 
     #[debug(skip)]
     terminated_handler: Arc<dyn TerminatedHandler>,
@@ -198,6 +199,7 @@ impl<M> SelfRef<M> {
         (
             Self {
                 actor_ref,
+                mailbox_capacity,
                 terminated_handler,
             },
             mailbox,
@@ -206,6 +208,10 @@ impl<M> SelfRef<M> {
 
     pub(crate) fn actor_ref(&self) -> &ActorRef<M> {
         &self.actor_ref
+    }
+
+    pub(crate) fn mailbox_capacity(&self) -> MailboxCapacity {
+        self.mailbox_capacity
     }
 
     pub(crate) fn make_watcher(&self) -> Watcher {
@@ -224,6 +230,7 @@ impl<M> Clone for SelfRef<M> {
     fn clone(&self) -> Self {
         Self {
             actor_ref: self.actor_ref.clone(),
+            mailbox_capacity: self.mailbox_capacity,
             terminated_handler: self.terminated_handler.clone(),
         }
     }
